@@ -26,7 +26,7 @@ class Settings(BaseSettings):
 
     model_device: str = "auto"
     codec_device: str = "auto"
-    model_precision: str = "bf16"
+    model_precision: str = "fp32"
     codec_precision: str = "fp32"
     codec_deterministic_encode: bool = True
     codec_deterministic_decode: bool = True

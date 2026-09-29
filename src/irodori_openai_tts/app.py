@@ -102,7 +102,13 @@ def startup() -> None:
     logger.info("voices directory: %s", voices_dir)
     if settings.preload:
         logger.info("preload enabled; loading runtime during startup")
-        runtime_manager.get()
+        try:
+            runtime_manager.get()
+        except (RuntimeError, torch.cuda.OutOfMemoryError) as exc:
+            if not _is_cuda_oom_runtime_error(exc):
+                raise
+            logger.warning("startup runtime load hit CUDA OOM; switching to CPU fallback: %s", exc)
+            runtime_manager.get_cpu_fallback()
     else:
         logger.info("preload disabled; runtime will load on first speech request")
 
@@ -345,12 +351,12 @@ async def create_speech(payload: SpeechRequest) -> Response:
         )
 
     try:
-        runtime = await _run_blocking(runtime_manager.get)
+        runtime = await _get_runtime_with_cpu_fallback()
     except RuntimeLoadTimeoutError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
-    sampling_request = await _prepare_cached_reference(runtime, sampling_request)
     synthesis_semaphore = await _acquire_synthesis_slot()
     try:
+        sampling_request = await _prepare_cached_reference(runtime, sampling_request)
         result = await _synthesize_chunks(runtime, sampling_request, chunks)
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -465,6 +471,17 @@ def _audio_duration_seconds(audio: Any, sample_rate: int) -> float:
 async def _run_blocking(func: Any, *args: Any, **kwargs: Any) -> Any:
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, partial(func, *args, **kwargs))
+
+
+async def _get_runtime_with_cpu_fallback() -> Any:
+    """Load the configured runtime, falling back to CPU when loading OOMs."""
+    try:
+        return await _run_blocking(runtime_manager.get)
+    except (RuntimeError, torch.cuda.OutOfMemoryError) as exc:
+        if not _is_cuda_oom_runtime_error(exc):
+            raise
+        logger.warning("runtime load hit CUDA OOM; switching to CPU fallback: %s", exc)
+        return await _run_blocking(runtime_manager.get_cpu_fallback)
 
 
 def _get_synthesis_semaphore() -> asyncio.Semaphore:
@@ -646,7 +663,7 @@ def _stream_speech_response(
     async def events() -> AsyncIterator[str]:
         completed = 0
         try:
-            runtime = await _run_blocking(runtime_manager.get)
+            runtime = await _get_runtime_with_cpu_fallback()
             for index, chunk in enumerate(chunks):
                 logger.info(
                     "speech stream chunk %d/%d started: chars=%d",
@@ -657,6 +674,7 @@ def _stream_speech_response(
                 chunk_request = replace(sampling_request, text=chunk)
                 synthesis_semaphore = await _acquire_synthesis_slot()
                 try:
+                    chunk_request = await _prepare_cached_reference(runtime, chunk_request)
                     try:
                         result = await _run_stream_blocking(
                             runtime.synthesize,
